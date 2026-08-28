@@ -153,6 +153,15 @@ def _db() -> sqlite3.Connection:
     # "LLM/DB/룰의 연결"을 그림이 아니라 실제 기록으로 보여주는 용도
     if "trace" not in cols:
         conn.execute("ALTER TABLE judgments ADD COLUMN trace TEXT")
+    # ── 학습 데이터용 원본 (2026-08-28 추가) ─────────────────────────────
+    # trace는 한 줄 요약("200 3695자 hops=1")이라 학습 피처가 못 된다. 주소만 남겨 두고
+    # 나중에 다시 긁는 길도 있지만 **그때의 관측이 아니다** — 실측: 서버가 "확인 불가"로
+    # 판정한 15건 중 8건이 PC 재수집에서는 본문이 읽혔다(서버는 3.5초 컷·Azure IP).
+    # 그 쌍으로 학습시키면 "멀쩡한 뉴스 본문 = 확인 불가"를 배운다.
+    # 판정 1건당 약 10KB. /home은 네트워크 디스크라 무한하지 않음 — 쌓이면 오래된 행부터 비울 것
+    for col in ("page_text", "tool_outputs", "prompt_text"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE judgments ADD COLUMN {col} TEXT")
     _schema_ready = True
     return conn
 
@@ -901,7 +910,8 @@ def _judge_with_agent(body: JudgeIn, site: str | None, key: str | None, started:
     if store_site and _cacheable(verdict):
         _cache[store_site] = verdict
     _remember(body.url, store_site, verdict, cached=False, took=time.monotonic() - started,
-              ad_key=key, trace=run.trace)
+              ad_key=key, trace=run.trace,
+              page_text=run.page_text, tool_outputs=run.tool_outputs, prompt_text=run.prompt_text)
     log.info(
         f"judge({'oneshot' if USE_ONESHOT else 'agent'}) {body.url[:80]} -> {verdict['risk']} "
         f"({time.monotonic() - started:.1f}s, tools={run.tool_calls}, llm={run.llm_calls})"
@@ -1084,7 +1094,8 @@ def _prejudge_run(target: str, site: str) -> None:
         if store_site and _cacheable(verdict):
             _cache[store_site] = verdict
         _remember(target, store_site, verdict, cached=False, took=time.monotonic() - started, ad_key=None,
-                  trace=[{"tool": "prejudge", "summary": "클릭 전"}] + run.trace)
+                  trace=[{"tool": "prejudge", "summary": "클릭 전"}] + run.trace,
+                  page_text=run.page_text, tool_outputs=run.tool_outputs, prompt_text=run.prompt_text)
         log.info(f"prejudge {target[:70]} -> {verdict['risk']} ({time.monotonic() - started:.1f}s)")
     except Exception as e:
         log.warning(f"prejudge 실패 {target[:70]}: {type(e).__name__}: {e}")
@@ -1094,12 +1105,15 @@ def _prejudge_run(target: str, site: str) -> None:
 
 
 def _remember(url: str, site: str | None, v: dict, cached: bool, took: float,
-              ad_key: str | None = None, trace: list | None = None) -> None:
+              ad_key: str | None = None, trace: list | None = None,
+              page_text: str | None = None, tool_outputs: list | None = None,
+              prompt_text: str | None = None) -> None:
     import json
     with _db() as db:
         db.execute(
-            "INSERT INTO judgments(at, url, site, risk, type, reason, advice, evidence, cached, took_s, ad_key, trace)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO judgments(at, url, site, risk, type, reason, advice, evidence, cached, took_s, ad_key, trace,"
+            " page_text, tool_outputs, prompt_text)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                 url, site, v["risk"], v.get("type", "none"), v["reason"], v["advice"],
@@ -1108,6 +1122,11 @@ def _remember(url: str, site: str | None, v: dict, cached: bool, took: float,
                 # 이 매핑 덕에 목적지 없는 트래커 광고도 두 번째 만남부터 식별 가능
                 ad_key,
                 json.dumps(trace, ensure_ascii=False) if trace else None,
+                # 학습 데이터용 원본. 캐시 적중·목록 적중 행은 도구를 안 돌렸으므로 전부 None —
+                # 그 행을 학습에 쓰면 같은 판정이 중복되거나 입력 없는 라벨이 된다
+                page_text,
+                json.dumps(tool_outputs, ensure_ascii=False) if tool_outputs else None,
+                prompt_text,
             ),
         )
 

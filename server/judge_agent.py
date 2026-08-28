@@ -688,6 +688,13 @@ class Run:
     page_text: str | None = None
     tool_calls: int = 0
     llm_calls: int = 0
+    # 학습 데이터용 — **판정 시점의 원본.** trace는 사람이 읽는 한 줄 요약이라
+    # ("200 3695자 hops=1") 학습 피처로 못 쓴다. 주소만 들고 나중에 다시 긁는 방법도 있지만
+    # 그때의 관측이 아니다 — 실측(2026-08-28): 서버가 "확인 불가"로 판정한 15건 중 8건이
+    # PC에서는 본문이 읽혔다(서버는 3.5초 컷·Azure IP, PC는 제한 없음). 그대로 학습시키면
+    # "멀쩡한 뉴스 본문 = 확인 불가"를 배운다. 라벨과 입력은 같은 관측이어야 한다
+    tool_outputs: list[dict] = field(default_factory=list)   # [{tool, args, output}] — 도구가 돌려준 JSON 전문
+    prompt_text: str | None = None                            # Claude가 받은 첫 user 메시지 전문
 
 
 class _Budget:
@@ -883,6 +890,8 @@ def run_agent(client, model: str, criteria: str, url: str, click_url: str | None
     budget = _Budget(started)
     trace: list[dict] = []
     outputs: list[str] = []          # 근거 검증용 — 도구가 돌려준 모든 텍스트
+    tool_outputs: list[dict] = []    # 학습 데이터용 — 같은 텍스트를 도구·인자와 함께 (Run.tool_outputs)
+    prompt_text: str | None = None   # 학습 데이터용 — 첫 user 메시지 전문 (Run.prompt_text)
     html_cache: dict[str, str] = {}  # page_signals가 fetch_page의 HTML을 재사용
     text_cache: dict[str, str] = {}  # 같은 HTML의 본문 — 파싱 한 번 더 안 함
     final_url: str | None = None
@@ -892,6 +901,9 @@ def run_agent(client, model: str, criteria: str, url: str, click_url: str | None
     def record(name: str, args: dict, t0: float, summary: str, result: dict | str) -> str:
         text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         outputs.append(text)
+        # trace와 **따로** 모은다 — trace는 /recent가 HTML로 그리는 것이라 원문을 끼우면
+        # 화면과 recent.py 수확이 통째로 터진다(지금도 100건 중 55건이 truncated)
+        tool_outputs.append({"tool": name, "args": args, "output": text})
         trace.append({"tool": name, "args": args, "ms": int((time.monotonic() - t0) * 1000), "summary": summary,
                       "phase": "pre" if not messages else "agent"})
         return text
@@ -994,6 +1006,7 @@ def run_agent(client, model: str, criteria: str, url: str, click_url: str | None
     first += ("\n\n이것으로 final_verdict를 내라." if oneshot
               else "\n\n충분하면 바로 final_verdict. 더 봐야 할 것이 있을 때만 도구를 써라.")
     messages.append({"role": "user", "content": first})
+    prompt_text = first
     # 시스템 프롬프트·도구 정의는 요청마다 동일 — 캐시로 호출마다 앞부분 처리 시간 절감
     # (Haiku 4.5는 4096토큰부터 캐시 — 지금 접두부는 그 언저리. usage.cache_read_input_tokens로 확인)
     system_blocks = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
@@ -1072,7 +1085,8 @@ def run_agent(client, model: str, criteria: str, url: str, click_url: str | None
         }
     verdict = _ground(verdict, outputs)
     run = Run(verdict=verdict, trace=trace, final_url=final_url, page_text=page_text,
-              tool_calls=budget.tool_calls, llm_calls=llm_calls)
+              tool_calls=budget.tool_calls, llm_calls=llm_calls,
+              tool_outputs=tool_outputs, prompt_text=prompt_text)
     log.info(
         f"agent {url[:70]} -> {verdict['risk']}/{verdict.get('type')} "
         f"tools={[t['tool'] for t in trace]} llm={llm_calls} {time.monotonic() - started:.1f}s"
